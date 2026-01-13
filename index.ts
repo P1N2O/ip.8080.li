@@ -28,6 +28,12 @@ const server = Bun.serve({
       "X-Client-IP": clientIp,
     };
 
+    // Icon
+    if (url.pathname.includes(`/favicon.ico`)) {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text x="50" y="50" font-size="90" text-anchor="middle" dominant-baseline="central">🌐</text></svg>`.trim();
+      return new Response(svg, { headers: { ...commonHeaders, "Cache-Control": "no-cache, no-store, must-revalidate", "Content-Type": "image/svg+xml" } });
+    }
+
     // JSON
     if (format === "json") {
       return new Response(`${JSON.stringify(payload)}\n`, { headers: { ...commonHeaders, "Content-Type": "application/json" } });
