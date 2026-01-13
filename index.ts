@@ -110,8 +110,8 @@ function serializeXML(payload: Record<string, unknown>): string {
 
 // Lookup Details
 const filepath = process.env.GEOIPUPDATE_DB_PATH || "/app/.data/db"
-const asnReader = await maxmind.open(filepath + "/GeoLite2-ASN.mmdb");
-const cityReader = await maxmind.open(filepath + "/GeoLite2-City.mmdb");
+const asnReader = await maxmind.open(filepath + "/GeoLite2-ASN.mmdb", { cache: { max: 10_000 }, watchForUpdates: true });
+const cityReader = await maxmind.open(filepath + "/GeoLite2-City.mmdb", { cache: { max: 10_000 }, watchForUpdates: true });
 function lookupDetails({ ip, isSearching = false, req}: { ip: string, isSearching?: boolean, req?: Request }) {
   const r: any = { ...asnReader.get(ip), ...cityReader.get(ip) };
   const cf = !isSearching ? req?.headers : undefined;
