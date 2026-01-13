@@ -8,10 +8,20 @@ services:
     ports:
       - "3000:3000"
     restart: unless-stopped
-    environment:
-      - PORT=3000
-      - DEBUG=true
-      - POWERED_BY="ip.8080.li"
+    env_file:
+      - .env
+    volumes:
+      - ./.data/db:/app/.data/db:ro
+
+  ip.8080.li-updater:
+    container_name: ip.8080.li-updater
+    image: ghcr.io/maxmind/geoipupdate
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.data/db:/usr/share/GeoIP
+
 networks:
   default:
       name: cloudflare

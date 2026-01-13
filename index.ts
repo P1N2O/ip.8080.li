@@ -1,38 +1,17 @@
+import maxmind from "maxmind";
+
 const server = Bun.serve({
   port: process.env.PORT || "3000",
 
-  fetch(req, server) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const format = url.searchParams.get("format") || url.searchParams.get("fmt") || url.pathname.split(".")[1] || "text";
     const callback = url.searchParams.get("callback") || url.searchParams.get("cb") || "callback";
-    const isGeo = url.pathname !== "/";
+    const showDetails = url.pathname !== "/";
 
-    const ip = req.headers.get("cf-connecting-ipv6") ||
-      req.headers.get("cf-connecting-ip") ||
-      req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") ||
-      server.requestIP(req)?.address || "localhost";
-
-    const country = req.headers.get("cf-ipcountry") || undefined;
-    const asRegion = req.headers.get("cf-ray")?.split("-")[1] || undefined;
-    const geo = isGeo? {
-        flag: country && getFlag(country),
-        continent: req.headers.get("cf-ipcontinent") || undefined,
-        country,
-        region: req.headers.get("cf-region") || undefined,
-        regionCode: req.headers.get("cf-region-code") || undefined,
-        city: req.headers.get("cf-ipcity") || undefined,
-        postalCode: req.headers.get("cf-postal-code") || undefined,
-        latitude: req.headers.get("cf-iplatitude") || undefined,
-        longitude: req.headers.get("cf-iplongitude") || undefined,
-        timezone: req.headers.get("cf-timezone") || undefined,
-        asRegion,
-        asn: req.headers.get("x-asn") || undefined,
-        asOrganization: req.headers.get("cf-asorganization") || undefined,
-        userAgent: req.headers.get("user-agent") || undefined
-      } : undefined;
-
-    const payload = { ip, ...geo };
-
+    const ip = url.searchParams.get("ip") || req.headers.get("cf-connecting-ipv6") || req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || server.requestIP(req)?.address || "localhost";
+    const details = showDetails ? lookupDetails(ip, req) : undefined;
+    const payload = { ip, ...details };
     const timestamp = new Date().toISOString();
 
     // DEBUG
@@ -126,4 +105,35 @@ function serializeXML(payload: Record<string, unknown>): string {
 
   xml += `\n</response>\n`;
   return xml;
+}
+
+// Lookup Details
+const filepath = process.env.GEOIPUPDATE_DB_PATH || "/app/.data/db"
+const asnReader = await maxmind.open(filepath + "/GeoLite2-ASN.mmdb");
+const cityReader = await maxmind.open(filepath + "/GeoLite2-City.mmdb");
+function lookupDetails(ip: string, req?: Request) {
+  const r: any = { ...asnReader.get(ip), ...cityReader.get(ip) };
+  const cf = req?.headers;
+  console.log(r);
+  
+  if (!r) return undefined;
+
+  return {
+    flag: getFlag(r?.country?.iso_code || cf?.get("cf-ipcountry")),
+    continentCode: r?.continent?.code || cf?.get("cf-ipcontinent"),
+    continent: r?.continent?.names?.en,
+    countryCode: r?.country?.iso_code || cf?.get("cf-ipcountry"),
+    country: r?.country?.names?.en,
+    regionCode: r?.subdivisions?.[0]?.iso_code || cf?.get("cf-region-code"),
+    region: r?.subdivisions?.[0]?.names?.en || cf?.get("cf-region"),
+    city: r?.city?.names?.en || cf?.get("cf-ipcity"),
+    postalCode: r?.postal?.code || cf?.get("cf-postal-code"),
+    latitude: r?.location?.latitude || cf?.get("cf-iplatitude"),
+    longitude: r?.location?.longitude || cf?.get("cf-iplongitude"),
+    timezone: r?.location?.time_zone || cf?.get("cf-timezone"),
+    asn: r?.autonomous_system_number || cf?.get("x-asn"),
+    asRegion: cf?.get("cf-ray")?.split("-")[1],
+    asOrganization: r?.autonomous_system_organization || cf?.get("cf-asorganization"),
+    userAgent: cf?.get("user-agent")
+  };
 }
