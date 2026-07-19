@@ -17,10 +17,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -112,9 +112,8 @@ type cityRecord struct {
 
 type server struct {
 	cfg        *config
-	asnReader  *maxminddb.Reader
-	cityReader *maxminddb.Reader
-	mu         sync.RWMutex
+	asnReader  atomic.Pointer[maxminddb.Reader]
+	cityReader atomic.Pointer[maxminddb.Reader]
 	logf       func(format string, v ...any)
 }
 
@@ -132,26 +131,20 @@ func (s *server) openReaders() error {
 	asnPath := filepath.Join(s.cfg.dbPath, "GeoLite2-ASN.mmdb")
 	cityPath := filepath.Join(s.cfg.dbPath, "GeoLite2-City.mmdb")
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Close old readers
-	if s.asnReader != nil {
-		s.asnReader.Close()
-	}
-	if s.cityReader != nil {
-		s.cityReader.Close()
-	}
-
-	var err error
-	s.asnReader, err = openReader(asnPath)
-	if err != nil {
+	if newReader, err := openReader(asnPath); err != nil {
 		s.logf("warn: %s: %v (ASN lookups disabled)", asnPath, err)
+	} else if old := s.asnReader.Swap(newReader); old != nil {
+		old.Close()
 	}
-	s.cityReader, err = openReader(cityPath)
-	if err != nil {
+
+	if newReader, err := openReader(cityPath); err != nil {
 		s.logf("warn: %s: %v (city lookups disabled)", cityPath, err)
+	} else if old := s.cityReader.Swap(newReader); old != nil {
+		old.Close()
 	}
+
+	// Invalidate cache since readers changed
+	sharedCache.clear()
 	return nil
 }
 
@@ -162,69 +155,131 @@ func openReader(path string) (*maxminddb.Reader, error) {
 	return maxminddb.Open(path)
 }
 
-func (s *server) lookup(ipStr string) map[string]any {
+// ─── Geo Cache ────────────────────────────────────────────────────────────────
+
+const cacheTTL = 5 * time.Minute
+const cacheMax = 1000
+
+type cacheEntry struct {
+	resp      geoResponse
+	expiresAt time.Time
+}
+
+type geoCache struct {
+	mu    sync.RWMutex
+	items map[string]*cacheEntry
+}
+
+func newGeoCache() *geoCache {
+	return &geoCache{items: make(map[string]*cacheEntry)}
+}
+
+func (c *geoCache) get(ip string) (geoResponse, bool) {
+	c.mu.RLock()
+	e, ok := c.items[ip]
+	c.mu.RUnlock()
+	if !ok {
+		return geoResponse{}, false
+	}
+	if time.Now().After(e.expiresAt) {
+		c.mu.Lock()
+		delete(c.items, ip)
+		c.mu.Unlock()
+		return geoResponse{}, false
+	}
+	return e.resp, true
+}
+
+func (c *geoCache) set(ip string, resp geoResponse) {
+	c.mu.Lock()
+	if len(c.items) >= cacheMax {
+		// Evict one random entry (good enough for 1000 entries)
+		for k := range c.items {
+			delete(c.items, k)
+			break
+		}
+	}
+	c.items[ip] = &cacheEntry{resp: resp, expiresAt: time.Now().Add(cacheTTL)}
+	c.mu.Unlock()
+}
+
+func (c *geoCache) clear() {
+	c.mu.Lock()
+	c.items = make(map[string]*cacheEntry)
+	c.mu.Unlock()
+}
+
+var sharedCache = newGeoCache()
+
+func (s *server) lookup(ipStr string) *geoResponse {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Cache hit
+	if cached, ok := sharedCache.get(ipStr); ok {
+		return &cached
+	}
 
-	result := make(map[string]any)
+	asnR := s.asnReader.Load()
+	cityR := s.cityReader.Load()
 
-	if s.asnReader != nil {
+	if asnR == nil && cityR == nil {
+		resp := &geoResponse{IP: ipStr}
+		sharedCache.set(ipStr, *resp)
+		return resp
+	}
+
+	resp := &geoResponse{IP: ipStr}
+
+	if asnR != nil {
 		var a asnRecord
-		if err := s.asnReader.Lookup(addr).Decode(&a); err == nil && a.Number > 0 {
-			result["autonomous_system_number"] = a.Number
-			if a.Organization != "" {
-				result["autonomous_system_organization"] = a.Organization
-			}
+		if err := asnR.Lookup(addr).Decode(&a); err == nil && a.Number > 0 {
+			resp.ASN = a.Number
+			resp.ASOrganization = a.Organization
 		}
 	}
 
-	if s.cityReader != nil {
+	if cityR != nil {
 		var c cityRecord
-		if err := s.cityReader.Lookup(addr).Decode(&c); err == nil {
+		if err := cityR.Lookup(addr).Decode(&c); err == nil {
 			if c.Continent.Code != "" {
-				result["continent"] = map[string]any{
-					"code":  c.Continent.Code,
-					"names": c.Continent.Names,
+				resp.ContinentCode = c.Continent.Code
+				if names, ok := c.Continent.Names["en"]; ok {
+					resp.Continent = names
 				}
 			}
 			if c.Country.ISOCode != "" {
-				result["country"] = map[string]any{
-					"iso_code": c.Country.ISOCode,
-					"names":    c.Country.Names,
+				resp.CountryCode = c.Country.ISOCode
+				if names, ok := c.Country.Names["en"]; ok {
+					resp.Country = names
 				}
 			}
 			if len(c.Subdivisions) > 0 {
-				subs := make([]map[string]any, len(c.Subdivisions))
-				for i, sd := range c.Subdivisions {
-					subs[i] = map[string]any{
-						"iso_code": sd.ISOCode,
-						"names":    sd.Names,
-					}
+				resp.RegionCode = c.Subdivisions[0].ISOCode
+				if names, ok := c.Subdivisions[0].Names["en"]; ok {
+					resp.Region = names
 				}
-				result["subdivisions"] = subs
 			}
 			if len(c.City.Names) > 0 {
-				result["city"] = map[string]any{"names": c.City.Names}
+				if names, ok := c.City.Names["en"]; ok {
+					resp.City = names
+				}
 			}
 			if c.Postal.Code != "" {
-				result["postal"] = map[string]any{"code": c.Postal.Code}
+				resp.PostalCode = c.Postal.Code
 			}
 			if c.Location.Latitude != 0 || c.Location.Longitude != 0 {
-				result["location"] = map[string]any{
-					"latitude":  c.Location.Latitude,
-					"longitude": c.Location.Longitude,
-					"time_zone": c.Location.TimeZone,
-				}
+				resp.Latitude = c.Location.Latitude
+				resp.Longitude = c.Location.Longitude
+				resp.Timezone = c.Location.TimeZone
 			}
 		}
 	}
 
-	return result
+	sharedCache.set(ipStr, *resp)
+	return resp
 }
 
 // ─── Background Updater ─────────────────────────────────────────────────────
@@ -264,46 +319,55 @@ func (s *server) updateDatabases() error {
 
 	_ = os.MkdirAll(s.cfg.dbPath, 0755)
 
+	var wg sync.WaitGroup
 	for _, id := range s.cfg.editionIDs {
-		editionID := id // "GeoLite2-ASN", "GeoLite2-City"
-		filePath := filepath.Join(s.cfg.dbPath, editionID+".mmdb")
+		wg.Add(1)
+		go func(editionID string) {
+			defer wg.Done()
 
-		// Compute current hash
-		var currentMD5 string
-		if data, err := os.ReadFile(filePath); err == nil {
-			h := md5.Sum(data)
-			currentMD5 = fmt.Sprintf("%x", h)
-		}
+			filePath := filepath.Join(s.cfg.dbPath, editionID+".mmdb")
 
-		needsUpdate, date, newMD5, err := s.checkMetadata(editionID, currentMD5)
-		if err != nil {
-			s.logf("  %s: metadata check failed: %v", editionID, err)
-			continue
-		}
-		if !needsUpdate {
-			s.logf("  %s: up to date", editionID)
-			continue
-		}
-
-		s.logf("  %s: downloading update...", editionID)
-		if err := s.downloadEdition(editionID, date, filePath); err != nil {
-			s.logf("  %s: download failed: %v", editionID, err)
-			continue
-		}
-
-		// Verify MD5
-		if data, err := os.ReadFile(filePath); err == nil {
-			h := md5.Sum(data)
-			actual := fmt.Sprintf("%x", h)
-			if newMD5 != "" && actual != newMD5 {
-				s.logf("  %s: MD5 mismatch (expected %s, got %s)", editionID, newMD5, actual)
-			} else {
-				s.logf("  %s: updated", editionID)
+			// Compute current hash
+			var currentMD5 string
+			if data, err := os.ReadFile(filePath); err == nil {
+				h := md5.Sum(data)
+				currentMD5 = fmt.Sprintf("%x", h)
 			}
-		}
+
+			needsUpdate, date, newMD5, err := s.checkMetadata(editionID, currentMD5)
+			if err != nil {
+				s.logf("  %s: metadata check failed: %v", editionID, err)
+				return
+			}
+			if !needsUpdate {
+				s.logf("  %s: up to date", editionID)
+				return
+			}
+
+			s.logf("  %s: downloading update...", editionID)
+			if err := s.downloadEdition(editionID, date, filePath); err != nil {
+				s.logf("  %s: download failed: %v", editionID, err)
+				return
+			}
+
+			// Verify MD5
+			if data, err := os.ReadFile(filePath); err == nil {
+				h := md5.Sum(data)
+				actual := fmt.Sprintf("%x", h)
+				if newMD5 != "" && actual != newMD5 {
+					s.logf("  %s: MD5 mismatch (expected %s, got %s)", editionID, newMD5, actual)
+				} else {
+					s.logf("  %s: updated", editionID)
+				}
+			}
+		}(id)
 	}
+	wg.Wait()
 	return nil
 }
+
+// ponytail: single client with timeout for all MaxMind API calls
+var updaterClient = &http.Client{Timeout: 30 * time.Second}
 
 func (s *server) checkMetadata(editionID, currentMD5 string) (needsUpdate bool, date string, newMD5 string, err error) {
 	endpoint := fmt.Sprintf("https://updates.maxmind.com/geoip/updates/metadata?edition_id=%s", url.QueryEscape(editionID))
@@ -311,14 +375,14 @@ func (s *server) checkMetadata(editionID, currentMD5 string) (needsUpdate bool, 
 	req.SetBasicAuth(s.cfg.accountID, s.cfg.licenseKey)
 	req.Header.Set("User-Agent", "ip.8080.li/1.0")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updaterClient.Do(req)
 	if err != nil {
 		return false, "", "", err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return false, "", "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -328,7 +392,7 @@ func (s *server) checkMetadata(editionID, currentMD5 string) (needsUpdate bool, 
 			MD5  string `json:"md5"`
 		} `json:"databases"`
 	}
-	if err := json.Unmarshal(body, &meta); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		return false, "", "", err
 	}
 	if len(meta.Databases) != 1 {
@@ -351,7 +415,7 @@ func (s *server) downloadEdition(editionID, date, filePath string) error {
 	req.SetBasicAuth(s.cfg.accountID, s.cfg.licenseKey)
 	req.Header.Set("User-Agent", "ip.8080.li/1.0")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updaterClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -410,6 +474,28 @@ func countryFlag(code string) string {
 }
 
 // ─── HTTP Handlers ──────────────────────────────────────────────────────────
+
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		next(&gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
+	}
+}
 
 type geoResponse struct {
 	IP               string  `json:"ip"`
@@ -487,47 +573,10 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Build response
 	resp := geoResponse{IP: ip}
 	if showDetails {
-		raw := s.lookup(ip)
-		if raw != nil {
-			if c, _ := raw["continent"].(map[string]any); c != nil {
-				resp.ContinentCode, _ = c["code"].(string)
-				if names, _ := c["names"].(map[string]any); names != nil {
-					resp.Continent, _ = names["en"].(string)
-				}
-			}
-			if c, _ := raw["country"].(map[string]any); c != nil {
-				resp.CountryCode, _ = c["iso_code"].(string)
-				if names, _ := c["names"].(map[string]any); names != nil {
-					resp.Country, _ = names["en"].(string)
-				}
-			}
-			if subs, _ := raw["subdivisions"].([]map[string]any); len(subs) > 0 {
-				resp.RegionCode, _ = subs[0]["iso_code"].(string)
-				if names, _ := subs[0]["names"].(map[string]any); names != nil {
-					resp.Region, _ = names["en"].(string)
-				}
-			} else if resp.CountryCode != "" {
-				// Try Cloudflare headers as fallback
-				resp.RegionCode = r.Header.Get("CF-Region-Code")
-				resp.Region = r.Header.Get("CF-Region")
-			}
-			if c, _ := raw["city"].(map[string]any); c != nil {
-				if names, _ := c["names"].(map[string]any); names != nil {
-					resp.City, _ = names["en"].(string)
-				}
-			}
-			if p, _ := raw["postal"].(map[string]any); p != nil {
-				resp.PostalCode, _ = p["code"].(string)
-			}
-			if loc, _ := raw["location"].(map[string]any); loc != nil {
-				resp.Latitude, _ = loc["latitude"].(float64)
-				resp.Longitude, _ = loc["longitude"].(float64)
-				resp.Timezone, _ = loc["time_zone"].(string)
-			}
-			resp.ASN, _ = raw["autonomous_system_number"].(uint)
-			resp.ASOrganization, _ = raw["autonomous_system_organization"].(string)
+		if raw := s.lookup(ip); raw != nil {
+			resp = *raw
 
-			// Fallback to Cloudflare
+			// Fallback to Cloudflare headers
 			if resp.CountryCode == "" {
 				resp.CountryCode = r.Header.Get("CF-IPCountry")
 			}
@@ -559,7 +608,10 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			if resp.ASOrganization == "" {
 				resp.ASOrganization = r.Header.Get("CF-ASOrganization")
 			}
-			// Region from CF ray
+			if resp.RegionCode == "" && resp.CountryCode != "" {
+				resp.RegionCode = r.Header.Get("CF-Region-Code")
+				resp.Region = r.Header.Get("CF-Region")
+			}
 			if resp.RegionCode == "" {
 				if ray := r.Header.Get("CF-Ray"); ray != "" {
 					if parts := strings.SplitN(ray, "-", 2); len(parts) == 2 {
@@ -578,6 +630,7 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	headers := w.Header()
 	headers.Set("Connection", "keep-alive")
 	headers.Set("Access-Control-Allow-Origin", "*")
+	headers.Set("Cache-Control", "public, max-age=60, s-maxage=300")
 
 	poweredBy := s.cfg.poweredBy
 	if poweredBy == "" {
@@ -597,6 +650,7 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	case "json":
 		headers.Set("Content-Type", "application/json")
 		b, _ := json.Marshal(resp)
+		headers.Set("Content-Length", strconv.Itoa(1+len(b)))
 		w.Write(b)
 		w.Write([]byte("\n"))
 
@@ -623,39 +677,47 @@ func serializeText(w io.Writer, r geoResponse) {
 		fmt.Fprintln(w, r.IP)
 		return
 	}
-	// Sort: ip first, then alphabetically
-	entries := [][2]string{
-		{"ip", r.IP},
-		{"flag", r.Flag},
-		{"continentCode", r.ContinentCode},
-		{"continent", r.Continent},
-		{"countryCode", r.CountryCode},
-		{"country", r.Country},
-		{"regionCode", r.RegionCode},
-		{"region", r.Region},
-		{"city", r.City},
-		{"postalCode", r.PostalCode},
+	// Hardcoded alphabetical order (ip first)
+	fmt.Fprintf(w, "ip: %s\n", r.IP)
+	if r.ASOrganization != "" {
+		fmt.Fprintf(w, "asOrganization: %s\n", r.ASOrganization)
+	}
+	if r.ASN > 0 {
+		fmt.Fprintf(w, "asn: %d\n", r.ASN)
+	}
+	if r.City != "" {
+		fmt.Fprintf(w, "city: %s\n", r.City)
+	}
+	if r.Continent != "" {
+		fmt.Fprintf(w, "continent: %s\n", r.Continent)
+	}
+	if r.ContinentCode != "" {
+		fmt.Fprintf(w, "continentCode: %s\n", r.ContinentCode)
+	}
+	if r.Country != "" {
+		fmt.Fprintf(w, "country: %s\n", r.Country)
+	}
+	if r.CountryCode != "" {
+		fmt.Fprintf(w, "countryCode: %s\n", r.CountryCode)
+	}
+	if r.Flag != "" {
+		fmt.Fprintf(w, "flag: %s\n", r.Flag)
 	}
 	if r.Latitude != 0 || r.Longitude != 0 {
-		entries = append(entries, [2]string{"latitude", fmt.Sprintf("%.6f", r.Latitude)})
-		entries = append(entries, [2]string{"longitude", fmt.Sprintf("%.6f", r.Longitude)})
+		fmt.Fprintf(w, "latitude: %.6f\n", r.Latitude)
+		fmt.Fprintf(w, "longitude: %.6f\n", r.Longitude)
 	}
-	entries = append(entries,
-		[2]string{"timezone", r.Timezone},
-	)
-	if r.ASN > 0 {
-		entries = append(entries, [2]string{"asn", strconv.FormatUint(uint64(r.ASN), 10)})
+	if r.PostalCode != "" {
+		fmt.Fprintf(w, "postalCode: %s\n", r.PostalCode)
 	}
-	if r.ASOrganization != "" {
-		entries = append(entries, [2]string{"asOrganization", r.ASOrganization})
+	if r.Region != "" {
+		fmt.Fprintf(w, "region: %s\n", r.Region)
 	}
-
-	sort.Slice(entries[1:], func(i, j int) bool { return entries[1:][i][0] < entries[1:][j][0] })
-
-	for _, e := range entries {
-		if e[1] != "" && e[1] != "0" {
-			fmt.Fprintf(w, "%s: %s\n", e[0], e[1])
-		}
+	if r.RegionCode != "" {
+		fmt.Fprintf(w, "regionCode: %s\n", r.RegionCode)
+	}
+	if r.Timezone != "" {
+		fmt.Fprintf(w, "timezone: %s\n", r.Timezone)
 	}
 }
 
@@ -710,7 +772,7 @@ func main() {
 	go srv.runUpdater(ctx)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", srv.handleRequest)
+	mux.HandleFunc("/", gzipMiddleware(srv.handleRequest))
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.port,
