@@ -73,8 +73,8 @@ func TestServerRoutes(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer resp.Body.Close()
-		if resp.Header.Get("Content-Type") != "text/plain" {
-			t.Errorf("Content-Type = %q", resp.Header.Get("Content-Type"))
+		if v := resp.Header.Get("Content-Type"); v != "text/plain; charset=utf-8" {
+			t.Errorf("Content-Type = %q", v)
 		}
 	})
 

@@ -666,7 +666,7 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		serializeXML(w, resp)
 
 	default: // text
-		headers.Set("Content-Type", "text/plain")
+		headers.Set("Content-Type", "text/plain; charset=utf-8")
 		serializeText(w, resp)
 	}
 }
