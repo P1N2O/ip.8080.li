@@ -78,7 +78,7 @@ docker compose up -d --build
 ## Credits
 
 - **[MaxMind](https://www.maxmind.com)** – GeoLite2 geolocation databases (ASN, City). GeoLite2 is distributed under the [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license.
-- **[IPsum](https://github.com/stamparm/ipsum)** – Threat intelligence feed of known malicious IPs, maintained by [Miroslav Stampar](https://github.com/stamparm). IPsum is in the public domain ([CC0](https://creativecommons.org/publicdomain/zero/1.0/)).
+- **[IPsum](https://github.com/stamparm/ipsum)** – Threat intelligence feed of known malicious IPs, maintained by [Miroslav Stampar](https://github.com/stamparm). IPsum is dedicated to the public domain ([The Unlicense](https://unlicense.org/)).
 
 ## LICENSE
 [MIT License](LICENSE)
