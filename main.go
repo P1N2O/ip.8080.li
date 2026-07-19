@@ -650,7 +650,6 @@ func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	case "json":
 		headers.Set("Content-Type", "application/json")
 		b, _ := json.Marshal(resp)
-		headers.Set("Content-Length", strconv.Itoa(1+len(b)))
 		w.Write(b)
 		w.Write([]byte("\n"))
 
