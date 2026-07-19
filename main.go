@@ -88,17 +88,15 @@ type cityRecord struct {
 		Names map[string]string `maxminddb:"names"`
 	} `maxminddb:"continent"`
 	Country struct {
-		GeonameID uint              `maxminddb:"geoname_id"`
-		ISOCode   string            `maxminddb:"iso_code"`
-		Names     map[string]string `maxminddb:"names"`
+		ISOCode string            `maxminddb:"iso_code"`
+		Names   map[string]string `maxminddb:"names"`
 	} `maxminddb:"country"`
 	Subdivisions []struct {
 		ISOCode string            `maxminddb:"iso_code"`
 		Names   map[string]string `maxminddb:"names"`
 	} `maxminddb:"subdivisions"`
 	City struct {
-		GeonameID uint              `maxminddb:"geoname_id"`
-		Names     map[string]string `maxminddb:"names"`
+		Names map[string]string `maxminddb:"names"`
 	} `maxminddb:"city"`
 	Postal struct {
 		Code string `maxminddb:"code"`
@@ -227,6 +225,12 @@ func (s *server) lookup(ipStr string) *geoResponse {
 	asnR := s.asnReader.Load()
 	cityR := s.cityReader.Load()
 
+	if asnR == nil && cityR == nil {
+		resp := &geoResponse{IP: ipStr}
+		sharedCache.set(ipStr, *resp)
+		return resp
+	}
+
 	resp := &geoResponse{IP: ipStr}
 
 	if asnR != nil {
@@ -251,7 +255,6 @@ func (s *server) lookup(ipStr string) *geoResponse {
 				if names, ok := c.Country.Names["en"]; ok {
 					resp.Country = names
 				}
-				resp.GeonameID = c.Country.GeonameID
 			}
 			if len(c.Subdivisions) > 0 {
 				resp.RegionCode = c.Subdivisions[0].ISOCode
@@ -260,7 +263,6 @@ func (s *server) lookup(ipStr string) *geoResponse {
 				}
 			}
 			if len(c.City.Names) > 0 {
-				resp.GeonameID = c.City.GeonameID
 				if names, ok := c.City.Names["en"]; ok {
 					resp.City = names
 				}
@@ -276,70 +278,6 @@ func (s *server) lookup(ipStr string) *geoResponse {
 		}
 	}
 
-	// ── Enrichment ──────────────────────────────────────────────────
-
-	// IP type
-	if addr.Is4() {
-		resp.IPType = "ipv4"
-	} else {
-		resp.IPType = "ipv6"
-	}
-
-	// Country data enrichment
-	if resp.CountryCode != "" {
-		resp.Flag = countryFlag(resp.CountryCode)
-		// ponytail: flagcdn.com is free, no API key needed
-		resp.CountryFlagURL = "https://flagcdn.com/" + strings.ToLower(resp.CountryCode) + ".svg"
-		resp.FlagUnicode = flagUnicode(resp.CountryCode)
-
-		if ci := getCountryInfo(resp.CountryCode); ci != nil {
-			resp.Capital = ci.Capital
-			resp.CallingCode = ci.CallingCode
-			resp.IsEU = ci.IsEU
-			if ci.Currency != nil {
-				resp.CurrencyCode = ci.Currency.Code
-				resp.CurrencyName = ci.Currency.Name
-				resp.CurrencySymbol = ci.Currency.Symbol
-			}
-			if len(ci.Languages) > 0 {
-				codes := make([]string, len(ci.Languages))
-				for i, l := range ci.Languages {
-					codes[i] = l.Code
-				}
-				resp.Languages = strings.Join(codes, ",")
-			}
-		}
-	}
-
-	// Timezone enrichment
-	if resp.Timezone != "" {
-		if loc, err := time.LoadLocation(resp.Timezone); err == nil {
-			now := time.Now().In(loc)
-			resp.CurrentTime = now.Format(time.RFC3339)
-			offset := 0
-			resp.TimezoneCode, offset = now.Zone()
-			resp.GMTOffset = offset
-			resp.IsDST = now.IsDST()
-		}
-	}
-
-	// ISP = ASOrganization
-	resp.ISP = resp.ASOrganization
-
-	// Security enrichment
-	if level, known := ipsumDB.lookup(ipStr); known {
-		resp.IsProxy = true
-		resp.IsTor = level >= 2
-		// ponytail: coarse mapping; IPsum doesn't distinguish crawler from proxy
-		resp.ThreatLevel = "low"
-		if level >= 2 {
-			resp.ThreatLevel = "medium"
-		}
-		if level >= 3 {
-			resp.ThreatLevel = "high"
-		}
-	}
-
 	sharedCache.set(ipStr, *resp)
 	return resp
 }
@@ -347,18 +285,11 @@ func (s *server) lookup(ipStr string) *geoResponse {
 // ─── Background Updater ─────────────────────────────────────────────────────
 
 func (s *server) runUpdater(ctx context.Context) {
-	// Initial load of all data sources
+	// Initial download if missing
 	if err := s.updateDatabases(); err != nil {
 		s.logf("initial DB download: %v", err)
 	}
 	s.openReaders()
-
-	if err := countryDBInstance.refresh(); err != nil {
-		s.logf("initial country data download: %v", err)
-	}
-	if err := ipsumDB.refresh(); err != nil {
-		s.logf("initial IPsum download: %v", err)
-	}
 
 	ticker := time.NewTicker(s.cfg.updateInterval)
 	defer ticker.Stop()
@@ -368,19 +299,11 @@ func (s *server) runUpdater(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.logf("checking for updates...")
-
+			s.logf("checking for DB updates...")
 			if err := s.updateDatabases(); err != nil {
 				s.logf("DB update failed: %v", err)
 			} else {
 				s.openReaders()
-			}
-
-			if err := countryDBInstance.refresh(); err != nil {
-				s.logf("country data refresh: %v", err)
-			}
-			if err := ipsumDB.refresh(); err != nil {
-				s.logf("IPsum refresh: %v", err)
 			}
 		}
 	}
@@ -550,13 +473,6 @@ func countryFlag(code string) string {
 	return string([]rune{r1, r2})
 }
 
-func flagUnicode(code string) string {
-	if len(code) != 2 {
-		return ""
-	}
-	return fmt.Sprintf("U+%X U+%X", 0x1F1E6+uint32(code[0]-'A'), 0x1F1E6+uint32(code[1]-'A'))
-}
-
 // ─── HTTP Handlers ──────────────────────────────────────────────────────────
 
 type gzipResponseWriter struct {
@@ -584,7 +500,6 @@ func gzipMiddleware(next http.HandlerFunc) http.HandlerFunc {
 type geoResponse struct {
 	IP               string  `json:"ip"`
 	Flag             string  `json:"flag,omitempty"`
-	IPType           string  `json:"type,omitempty"`
 	ContinentCode    string  `json:"continentCode,omitempty"`
 	Continent        string  `json:"continent,omitempty"`
 	CountryCode      string  `json:"countryCode,omitempty"`
@@ -596,25 +511,6 @@ type geoResponse struct {
 	Latitude         float64 `json:"latitude,omitempty"`
 	Longitude        float64 `json:"longitude,omitempty"`
 	Timezone         string  `json:"timezone,omitempty"`
-	GeonameID        uint    `json:"geonameID,omitempty"`
-	CountryFlagURL   string  `json:"countryFlagURL,omitempty"`
-	FlagUnicode      string  `json:"flagUnicode,omitempty"`
-	Capital          string  `json:"capital,omitempty"`
-	Languages        string  `json:"languages,omitempty"`
-	CallingCode      string  `json:"callingCode,omitempty"`
-	IsEU             bool    `json:"isEU,omitempty"`
-	CurrencyCode     string  `json:"currencyCode,omitempty"`
-	CurrencyName     string  `json:"currencyName,omitempty"`
-	CurrencySymbol   string  `json:"currencySymbol,omitempty"`
-	CurrentTime      string  `json:"currentTime,omitempty"`
-	GMTOffset        int     `json:"gmtOffset,omitempty"`
-	TimezoneCode     string  `json:"timezoneCode,omitempty"`
-	IsDST            bool    `json:"isDST,omitempty"`
-	ISP              string  `json:"isp,omitempty"`
-	IsProxy          bool    `json:"isProxy,omitempty"`
-	IsCrawler        bool    `json:"isCrawler,omitempty"`
-	IsTor            bool    `json:"isTor,omitempty"`
-	ThreatLevel      string  `json:"threatLevel,omitempty"`
 	ASN              uint    `json:"asn,omitempty"`
 	ASOrganization   string  `json:"asOrganization,omitempty"`
 }
@@ -816,55 +712,6 @@ func serializeText(w io.Writer, r geoResponse) {
 	if r.Timezone != "" {
 		fmt.Fprintf(w, "timezone: %s\n", r.Timezone)
 	}
-	if r.GeonameID > 0 {
-		fmt.Fprintf(w, "geonameID: %d\n", r.GeonameID)
-	}
-	if r.CountryFlagURL != "" {
-		fmt.Fprintf(w, "countryFlagURL: %s\n", r.CountryFlagURL)
-	}
-	if r.FlagUnicode != "" {
-		fmt.Fprintf(w, "flagUnicode: %s\n", r.FlagUnicode)
-	}
-	if r.Capital != "" {
-		fmt.Fprintf(w, "capital: %s\n", r.Capital)
-	}
-	if r.Languages != "" {
-		fmt.Fprintf(w, "languages: %s\n", r.Languages)
-	}
-	if r.CallingCode != "" {
-		fmt.Fprintf(w, "callingCode: %s\n", r.CallingCode)
-	}
-	if r.IsEU {
-		fmt.Fprintf(w, "isEU: true\n")
-	}
-	if r.CurrencyCode != "" {
-		if r.CurrencySymbol != "" {
-			fmt.Fprintf(w, "currency: %s (%s)\n", r.CurrencyCode, r.CurrencySymbol)
-		} else {
-			fmt.Fprintf(w, "currency: %s\n", r.CurrencyCode)
-		}
-	}
-	if r.CurrentTime != "" {
-		fmt.Fprintf(w, "currentTime: %s\n", r.CurrentTime)
-	}
-	if r.GMTOffset != 0 {
-		fmt.Fprintf(w, "gmtOffset: %d\n", r.GMTOffset)
-	}
-	if r.TimezoneCode != "" {
-		fmt.Fprintf(w, "timezoneCode: %s\n", r.TimezoneCode)
-	}
-	if r.IsDST {
-		fmt.Fprintf(w, "isDST: true\n")
-	}
-	if r.ISP != "" {
-		fmt.Fprintf(w, "isp: %s\n", r.ISP)
-	}
-	if r.IsProxy {
-		fmt.Fprintf(w, "isProxy: true\n")
-	}
-	if r.ThreatLevel != "" {
-		fmt.Fprintf(w, "threatLevel: %s\n", r.ThreatLevel)
-	}
 	if r.ASN > 0 {
 		fmt.Fprintf(w, "asn: %d\n", r.ASN)
 	}
@@ -891,27 +738,6 @@ func serializeXML(w io.Writer, r geoResponse) {
 		writeXMLField(w, "longitude", fmt.Sprintf("%.6f", r.Longitude), 1)
 	}
 	writeXMLField(w, "timezone", r.Timezone, 1)
-	writeXMLFieldInt(w, "geonameID", int(r.GeonameID), 1)
-	writeXMLField(w, "countryFlagURL", r.CountryFlagURL, 1)
-	writeXMLField(w, "flagUnicode", r.FlagUnicode, 1)
-	writeXMLField(w, "capital", r.Capital, 1)
-	writeXMLField(w, "languages", r.Languages, 1)
-	writeXMLField(w, "callingCode", r.CallingCode, 1)
-	writeXMLFieldBool(w, "isEU", r.IsEU, 1)
-	if r.CurrencyCode != "" {
-		writeXMLField(w, "currencyCode", r.CurrencyCode, 1)
-		writeXMLField(w, "currencyName", r.CurrencyName, 1)
-		writeXMLField(w, "currencySymbol", r.CurrencySymbol, 1)
-	}
-	writeXMLField(w, "currentTime", r.CurrentTime, 1)
-	writeXMLFieldInt(w, "gmtOffset", r.GMTOffset, 1)
-	writeXMLField(w, "timezoneCode", r.TimezoneCode, 1)
-	writeXMLFieldBool(w, "isDST", r.IsDST, 1)
-	writeXMLField(w, "isp", r.ISP, 1)
-	writeXMLFieldBool(w, "isProxy", r.IsProxy, 1)
-	writeXMLFieldBool(w, "isCrawler", r.IsCrawler, 1)
-	writeXMLFieldBool(w, "isTor", r.IsTor, 1)
-	writeXMLField(w, "threatLevel", r.ThreatLevel, 1)
 	if r.ASN > 0 {
 		writeXMLField(w, "asn", strconv.FormatUint(uint64(r.ASN), 10), 1)
 	}
@@ -929,22 +755,6 @@ func writeXMLField(w io.Writer, tag, value string, indent int) {
 	fmt.Fprintf(w, "</%s>\n", xmlProcInst(tag))
 }
 
-func writeXMLFieldInt(w io.Writer, tag string, value int, indent int) {
-	if value == 0 {
-		return
-	}
-	xml.EscapeText(w, []byte(strings.Repeat("  ", indent)))
-	fmt.Fprintf(w, "<%s>%d</%s>\n", xmlProcInst(tag), value, xmlProcInst(tag))
-}
-
-func writeXMLFieldBool(w io.Writer, tag string, value bool, indent int) {
-	if !value {
-		return
-	}
-	xml.EscapeText(w, []byte(strings.Repeat("  ", indent)))
-	fmt.Fprintf(w, "<%s>true</%s>\n", xmlProcInst(tag), xmlProcInst(tag))
-}
-
 // ponytail: xmlProcInst is not a real procinst, just a helper name
 func xmlProcInst(s string) string { return s }
 
@@ -957,7 +767,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Start background updater (GeoIP + country data + IPsum)
+	// Start background updater
 	go srv.runUpdater(ctx)
 
 	mux := http.NewServeMux()
