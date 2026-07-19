@@ -8,6 +8,7 @@ A simple HTTP server that returns the visitor's IP address in Plain Text, JSON, 
 - Response optionally includes flag, continent, country, region, city, postal code, coordinates, timezone, and ASN details
 - No API key required. No ratelimit
 - 100% Free and Open Source
+- **All-in-one binary** – GeoIP database auto-updates built in (no separate updater needed)
 
 ## Usage
 
@@ -39,7 +40,7 @@ A simple HTTP server that returns the visitor's IP address in Plain Text, JSON, 
 
 ---
 
-## Development (Bun)
+## Development (Go)
 
 ```bash
 # clone this project
@@ -51,11 +52,8 @@ cd ip.8080.li
 # copy and set env variables
 cp .env.example .env
 
-# install dependencies
-bun i
-
-# start dev server
-bun dev
+# run directly
+go run .
 ```
 
 ## Deployment (Docker)
@@ -73,6 +71,8 @@ cp .env.example .env
 # build and start container
 docker compose up -d --build
 ```
+
+> **Note:** The GeoIP database auto-updater runs in the same process. Set `GEOIPUPDATE_ACCOUNT_ID`, `GEOIPUPDATE_LICENSE_KEY`, and `GEOIPUPDATE_EDITION_IDS` in your `.env` to enable automatic updates.
 
 ## LICENSE
 [MIT License](LICENSE)

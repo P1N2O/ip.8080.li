@@ -11,18 +11,9 @@ services:
     env_file:
       - .env
     volumes:
-      - ./.data/db:/app/.data/db:ro
-
-  ip.8080.li-updater:
-    container_name: ip.8080.li-updater
-    image: ghcr.io/maxmind/geoipupdate
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./.data/db:/usr/share/GeoIP
+      - ./.data/db:/app/.data/db
 
 networks:
   default:
-      name: cloudflare
-      external: true
+    name: cloudflare
+    external: true
