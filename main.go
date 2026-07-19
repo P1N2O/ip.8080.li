@@ -676,47 +676,47 @@ func serializeText(w io.Writer, r geoResponse) {
 		fmt.Fprintln(w, r.IP)
 		return
 	}
-	// Hardcoded alphabetical order (ip first)
+	// JSON/struct field order (matches json output)
 	fmt.Fprintf(w, "ip: %s\n", r.IP)
-	if r.ASOrganization != "" {
-		fmt.Fprintf(w, "asOrganization: %s\n", r.ASOrganization)
-	}
-	if r.ASN > 0 {
-		fmt.Fprintf(w, "asn: %d\n", r.ASN)
-	}
-	if r.City != "" {
-		fmt.Fprintf(w, "city: %s\n", r.City)
-	}
-	if r.Continent != "" {
-		fmt.Fprintf(w, "continent: %s\n", r.Continent)
+	if r.Flag != "" {
+		fmt.Fprintf(w, "flag: %s\n", r.Flag)
 	}
 	if r.ContinentCode != "" {
 		fmt.Fprintf(w, "continentCode: %s\n", r.ContinentCode)
 	}
-	if r.Country != "" {
-		fmt.Fprintf(w, "country: %s\n", r.Country)
+	if r.Continent != "" {
+		fmt.Fprintf(w, "continent: %s\n", r.Continent)
 	}
 	if r.CountryCode != "" {
 		fmt.Fprintf(w, "countryCode: %s\n", r.CountryCode)
 	}
-	if r.Flag != "" {
-		fmt.Fprintf(w, "flag: %s\n", r.Flag)
+	if r.Country != "" {
+		fmt.Fprintf(w, "country: %s\n", r.Country)
+	}
+	if r.RegionCode != "" {
+		fmt.Fprintf(w, "regionCode: %s\n", r.RegionCode)
+	}
+	if r.Region != "" {
+		fmt.Fprintf(w, "region: %s\n", r.Region)
+	}
+	if r.City != "" {
+		fmt.Fprintf(w, "city: %s\n", r.City)
+	}
+	if r.PostalCode != "" {
+		fmt.Fprintf(w, "postalCode: %s\n", r.PostalCode)
 	}
 	if r.Latitude != 0 || r.Longitude != 0 {
 		fmt.Fprintf(w, "latitude: %.6f\n", r.Latitude)
 		fmt.Fprintf(w, "longitude: %.6f\n", r.Longitude)
 	}
-	if r.PostalCode != "" {
-		fmt.Fprintf(w, "postalCode: %s\n", r.PostalCode)
-	}
-	if r.Region != "" {
-		fmt.Fprintf(w, "region: %s\n", r.Region)
-	}
-	if r.RegionCode != "" {
-		fmt.Fprintf(w, "regionCode: %s\n", r.RegionCode)
-	}
 	if r.Timezone != "" {
 		fmt.Fprintf(w, "timezone: %s\n", r.Timezone)
+	}
+	if r.ASN > 0 {
+		fmt.Fprintf(w, "asn: %d\n", r.ASN)
+	}
+	if r.ASOrganization != "" {
+		fmt.Fprintf(w, "asOrganization: %s\n", r.ASOrganization)
 	}
 }
 

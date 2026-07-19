@@ -30,7 +30,7 @@ func TestSerializeText(t *testing.T) {
 				ASN:           15169,
 				ASOrganization: "Google LLC",
 			},
-			want: "ip: 1.2.3.4\nasOrganization: Google LLC\nasn: 15169\ncity: Mountain View\ncountry: United States\ncountryCode: US\nflag: 🇺🇸\n",
+			want: "ip: 1.2.3.4\nflag: 🇺🇸\ncountryCode: US\ncountry: United States\ncity: Mountain View\nasn: 15169\nasOrganization: Google LLC\n",
 		},
 	}
 
