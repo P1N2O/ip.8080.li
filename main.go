@@ -24,6 +24,8 @@ import (
 	"syscall"
 	"time"
 
+	"bufio"
+
 	"github.com/oschwald/maxminddb-golang/v2"
 )
 
@@ -211,6 +213,89 @@ func (c *geoCache) clear() {
 
 var sharedCache = newGeoCache()
 
+// ─── IPsum Threat Feed ────────────────────────────────────────────────────
+
+// ponytail: simple in-memory map, full replace on refresh, no per-entry eviction
+var ipsumClient = &http.Client{Timeout: 30 * time.Second}
+
+const ipsumURL = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
+
+type ipsumList struct {
+	mu    sync.RWMutex
+	items map[netip.Addr]int
+}
+
+var ipsumData = &ipsumList{items: make(map[netip.Addr]int)}
+
+func (l *ipsumList) get(addr netip.Addr) int {
+	l.mu.RLock()
+	score := l.items[addr]
+	l.mu.RUnlock()
+	return score
+}
+
+func (s *server) fetchIPsum() error {
+	resp, err := ipsumClient.Get(ipsumURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	m := make(map[netip.Addr]int)
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		addr, err := netip.ParseAddr(strings.TrimSpace(parts[0]))
+		if err != nil {
+			continue
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if n > 0 {
+			m[addr] = n
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+
+	ipsumData.mu.Lock()
+	ipsumData.items = m
+	ipsumData.mu.Unlock()
+	return nil
+}
+
+func (s *server) runIPsumFetcher(ctx context.Context) {
+	// Initial fetch
+	if err := s.fetchIPsum(); err != nil {
+		s.logf("ipsum: initial fetch failed: %v", err)
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.fetchIPsum(); err != nil {
+				s.logf("ipsum: fetch failed: %v", err)
+			}
+		}
+	}
+}
+
 func (s *server) lookup(ipStr string) *geoResponse {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {
@@ -225,13 +310,17 @@ func (s *server) lookup(ipStr string) *geoResponse {
 	asnR := s.asnReader.Load()
 	cityR := s.cityReader.Load()
 
+	resp := &geoResponse{IP: ipStr}
+
+	// ponytail: check threat feed alongside geo
+	if score := ipsumData.get(addr); score > 0 {
+		resp.ThreatScore = score
+	}
+
 	if asnR == nil && cityR == nil {
-		resp := &geoResponse{IP: ipStr}
 		sharedCache.set(ipStr, *resp)
 		return resp
 	}
-
-	resp := &geoResponse{IP: ipStr}
 
 	if asnR != nil {
 		var a asnRecord
@@ -513,6 +602,7 @@ type geoResponse struct {
 	Timezone         string  `json:"timezone,omitempty"`
 	ASN              uint    `json:"asn,omitempty"`
 	ASOrganization   string  `json:"asOrganization,omitempty"`
+	ThreatScore      int     `json:"threatScore"`
 }
 
 func (s *server) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -718,6 +808,7 @@ func serializeText(w io.Writer, r geoResponse) {
 	if r.ASOrganization != "" {
 		fmt.Fprintf(w, "asOrganization: %s\n", r.ASOrganization)
 	}
+	fmt.Fprintf(w, "threatScore: %d\n", r.ThreatScore)
 }
 
 func serializeXML(w io.Writer, r geoResponse) {
@@ -742,6 +833,9 @@ func serializeXML(w io.Writer, r geoResponse) {
 		writeXMLField(w, "asn", strconv.FormatUint(uint64(r.ASN), 10), 1)
 	}
 	writeXMLField(w, "asOrganization", r.ASOrganization, 1)
+	fmt.Fprintf(w, "  <%s>", "threatScore")
+	xml.EscapeText(w, []byte(strconv.FormatInt(int64(r.ThreatScore), 10)))
+	fmt.Fprintf(w, "</%s>\n", "threatScore")
 	io.WriteString(w, "</response>\n")
 }
 
@@ -769,6 +863,9 @@ func main() {
 
 	// Start background updater
 	go srv.runUpdater(ctx)
+
+	// Start IPsum threat feed fetcher
+	go srv.runIPsumFetcher(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", gzipMiddleware(srv.handleRequest))

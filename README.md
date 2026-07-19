@@ -9,6 +9,7 @@ A simple HTTP server that returns the visitor's IP address in Plain Text, JSON, 
 - No API key required. No ratelimit
 - 100% Free and Open Source
 - **All-in-one binary** – GeoIP database auto-updates built in (no separate updater needed)
+- **Threat intelligence** – checks IPs against the [IPsum](https://github.com/stamparm/ipsum) threat feed
 
 ## Usage
 
@@ -73,6 +74,11 @@ docker compose up -d --build
 ```
 
 > **Note:** The GeoIP database auto-updater runs in the same process. Set `GEOIPUPDATE_ACCOUNT_ID`, `GEOIPUPDATE_LICENSE_KEY`, and `GEOIPUPDATE_EDITION_IDS` in your `.env` to enable automatic updates.
+
+## Credits
+
+- **[MaxMind](https://www.maxmind.com)** – GeoLite2 geolocation databases (ASN, City). GeoLite2 is distributed under the [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license.
+- **[IPsum](https://github.com/stamparm/ipsum)** – Threat intelligence feed of known malicious IPs, maintained by [Miroslav Stampar](https://github.com/stamparm). IPsum is in the public domain ([CC0](https://creativecommons.org/publicdomain/zero/1.0/)).
 
 ## LICENSE
 [MIT License](LICENSE)
